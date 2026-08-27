@@ -27,15 +27,18 @@ Key ideas:
 """
 
 import io
+import json
+import time
 import uuid
 import hashlib
+import urllib.request
 import db
 import datetime as dt
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from dash import Dash, dcc, html, Input, Output, State, ALL, callback_context, no_update
+from dash import Dash, dcc, html, dash_table, Input, Output, State, ALL, callback_context, no_update
 import dash_bootstrap_components as dbc
 from dash.exceptions import PreventUpdate
 
@@ -43,10 +46,27 @@ from dash.exceptions import PreventUpdate
 # 1. CSV parsing
 # ==============================================================
 
+# Wealthsimple has exported two different shapes of this column at different
+# times: a single 'effective_at' timestamp, or separate 'effective_date' +
+# 'effective_time' columns. Both are accepted; REQUIRED_WS_COLS covers
+# everything else that's the same in both.
 REQUIRED_WS_COLS = {
-    'effective_at', 'settlement_date', 'activity_type', 'activity_sub_type',
+    'settlement_date', 'activity_type', 'activity_sub_type',
     'direction', 'symbol', 'name', 'currency', 'quantity', 'unit_price', 'commission'
 }
+
+
+def _missing_ws_cols(columns) -> set:
+    """REQUIRED_WS_COLS, plus a check that at least one 'when did this happen'
+    column shape is present ('effective_at', or 'effective_date' with
+    'effective_time')."""
+    columns = set(columns)
+    missing = REQUIRED_WS_COLS - columns
+    has_effective_at = 'effective_at' in columns
+    has_split_effective = {'effective_date', 'effective_time'}.issubset(columns)
+    if not has_effective_at and not has_split_effective:
+        missing.add('effective_at (or effective_date + effective_time)')
+    return missing
 
 
 def decode_upload(contents: str) -> str:
@@ -71,8 +91,14 @@ def parse_wealthsimple_csv(contents: str) -> pd.DataFrame:
     text = decode_upload(contents)
     df = pd.read_csv(io.StringIO(text))
     df.columns = [c.strip().lower() for c in df.columns]
+    # Two raw headers that only differ in case/whitespace (e.g. "Symbol" and
+    # "symbol ") collapse to the same name above -- keep just the first so a
+    # later `trades['symbol']` lookup returns a scalar per row, not a Series
+    # (which SQLite can't bind: "Error binding parameter 1: type 'Series' is
+    # not supported").
+    df = df.loc[:, ~df.columns.duplicated()]
 
-    missing = REQUIRED_WS_COLS - set(df.columns)
+    missing = _missing_ws_cols(df.columns)
     if missing:
         raise ValueError(f"CSV is missing expected Wealthsimple columns: {sorted(missing)}")
 
@@ -81,7 +107,14 @@ def parse_wealthsimple_csv(contents: str) -> pd.DataFrame:
         return pd.DataFrame(columns=['symbol', 'name', 'timestamp', 'action', 'qty',
                                       'price', 'currency', 'commission', 'description'])
 
-    trades['timestamp'] = pd.to_datetime(trades['effective_at'], errors='coerce', utc=True)
+    if 'effective_at' in trades.columns:
+        trades['timestamp'] = pd.to_datetime(trades['effective_at'], errors='coerce', utc=True)
+    else:
+        # Newer export shape: date and time of day in separate columns.
+        trades['timestamp'] = pd.to_datetime(
+            trades['effective_date'].astype(str) + ' ' + trades['effective_time'].astype(str),
+            errors='coerce', utc=True,
+        )
     fallback = pd.to_datetime(trades['settlement_date'], errors='coerce', utc=True)
     trades['timestamp'] = trades['timestamp'].fillna(fallback)
 
@@ -108,6 +141,7 @@ def parse_generic_csv(contents: str) -> pd.DataFrame:
     text = decode_upload(contents)
     df = pd.read_csv(io.StringIO(text))
     df.columns = [c.strip().lower() for c in df.columns]
+    df = df.loc[:, ~df.columns.duplicated()]  # see parse_wealthsimple_csv for why
 
     mapping = {
         'symbol': ['symbol', 'ticker', 'description'],
@@ -116,13 +150,27 @@ def parse_generic_csv(contents: str) -> pd.DataFrame:
         'price': ['price', 'unit'],
         'qty': ['qty', 'quantity', 'shares'],
     }
+    # Exact column-name matches first, substring/fuzzy guessing only for whatever's
+    # left -- otherwise a fuzzy candidate (e.g. 'description', a fallback for
+    # 'symbol') can steal a rename ahead of an exact 'symbol' column that comes
+    # later in the header, producing two 'symbol' columns after rename() (which
+    # breaks every `row['symbol']` lookup downstream: it returns a Series, not a
+    # scalar, and sqlite3 can't bind that -- this is exactly how a real
+    # Wealthsimple export with a 'description' column before 'symbol' crashed).
     rename = {}
+    claimed = set()
+    for req in mapping:
+        if req in df.columns:
+            claimed.add(req)
     for req, candidates in mapping.items():
+        if req in claimed:
+            continue
         for col in df.columns:
-            if col in rename.values():
+            if col in claimed:
                 continue
             if any(c in col for c in candidates):
                 rename[col] = req
+                claimed.add(col)
                 break
     df = df.rename(columns=rename)
 
@@ -156,8 +204,340 @@ def detect_csv_format(contents: str) -> str:
     if not lines:
         return 'generic'
     header = lines[0].lower()
-    ws_keywords = ['effective_at', 'settlement_date', 'activity_type', 'activity_sub_type']
-    return 'wealthsimple' if all(k in header for k in ws_keywords) else 'generic'
+    ws_keywords = ['settlement_date', 'activity_type', 'activity_sub_type']
+    has_time_col = 'effective_at' in header or ('effective_date' in header and 'effective_time' in header)
+    return 'wealthsimple' if has_time_col and all(k in header for k in ws_keywords) else 'generic'
+
+
+# ==============================================================
+# 1b. ATR
+#
+# Two sources, tried in order:
+#   1. Live TradingView Desktop, read directly over the Chrome DevTools
+#      Protocol (CDP) debug port (127.0.0.1:9222) that TradingView Desktop
+#      exposes -- the same port the tradingview-mcp server connects to. CDP
+#      supports multiple independent debugger connections to one target, so
+#      this doesn't conflict with a Claude Code session already attached via
+#      MCP; it also means no MCP client/Node process is needed here, just a
+#      raw websocket call. Before reading bars, this actively brings the chart
+#      into a known-good state -- corrects the symbol if it doesn't match the
+#      plan, and forces the 1D timeframe -- rather than just reading whatever
+#      happens to be on screen. This does mutate the user's live TradingView
+#      Desktop session; that's a deliberate choice made after testing showed a
+#      passive read-and-warn design was worse (silently used the wrong
+#      instrument's ATR too often). Switching the *saved layout* was tried too
+#      but dropped -- TradingView has a documented bug where switching between
+#      custom/saved layouts via the API doesn't reliably apply, confirmed by
+#      hands-on testing here. The user manages the layout manually; symbol and
+#      timeframe correction both tested reliable and stay automatic.
+#   2. Yahoo Finance (yfinance), as a proxy when TradingView Desktop isn't
+#      reachable -- always daily bars, regardless of the plan's intended
+#      timeframe, so it's a coarser approximation than a live TradingView read.
+# Either way, the fetched value always lands in an editable field so the real
+# TradingView reading can override it before committing.
+# ==============================================================
+
+ATR_PERIOD = 14
+TV_CDP_HOST = '127.0.0.1'
+TV_CDP_PORT = 9222
+TV_TARGET_RESOLUTION = '1D'
+
+
+def compute_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.Series:
+    """Wilder's-smoothing ATR (matches Pine Script's ta.atr default smoothing)."""
+    high, low, close = df['High'], df['Low'], df['Close']
+    prev_close = close.shift(1)
+    true_range = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return true_range.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def _tv_cdp_find_chart_target():
+    """Find the CDP target (browser tab) for the open TradingView chart."""
+    url = f"http://{TV_CDP_HOST}:{TV_CDP_PORT}/json/list"
+    with urllib.request.urlopen(url, timeout=3) as resp:
+        targets = json.loads(resp.read())
+    for t in targets:
+        if t.get('type') == 'page' and 'tradingview.com/chart' in t.get('url', ''):
+            return t
+    for t in targets:
+        if t.get('type') == 'page' and 'tradingview' in t.get('url', '').lower():
+            return t
+    return None
+
+
+def _tv_cdp_evaluate(ws_url: str, expression: str, timeout: int = 10):
+    """Send one Runtime.evaluate command over a CDP websocket and return its value."""
+    import websocket  # imported lazily -- only needed when this is actually called
+    # suppress_origin: Electron's CDP debug port rejects WebSocket handshakes that
+    # carry an Origin header unless it's been allowlisted via --remote-allow-origins
+    # (TradingView Desktop wasn't launched with that flag). Sending no Origin header
+    # at all -- what Node's chrome-remote-interface does -- passes the check.
+    ws = websocket.create_connection(ws_url, timeout=timeout, suppress_origin=True)
+    try:
+        ws.send(json.dumps({
+            'id': 1,
+            'method': 'Runtime.evaluate',
+            'params': {'expression': expression, 'returnByValue': True, 'awaitPromise': True},
+        }))
+        while True:
+            msg = json.loads(ws.recv())
+            if msg.get('id') != 1:
+                continue  # ignore unrelated CDP events sharing this socket
+            if 'error' in msg:
+                raise RuntimeError(msg['error'].get('message', 'CDP error'))
+            result = msg.get('result', {})
+            if result.get('exceptionDetails'):
+                detail = result['exceptionDetails']
+                raise RuntimeError(detail.get('exception', {}).get('description') or detail.get('text', 'JS evaluation error'))
+            return result.get('result', {}).get('value')
+    finally:
+        ws.close()
+
+
+def _tv_poll_until(fn, predicate, timeout=8, interval=0.4):
+    """Call fn() repeatedly (swallowing exceptions) until predicate(value) is
+    true or timeout elapses. Returns the last value seen either way -- callers
+    check the returned state themselves rather than treating a timeout as fatal,
+    since the chart may still be usably close to ready."""
+    deadline = time.monotonic() + timeout
+    value = None
+    while True:
+        try:
+            value = fn()
+        except Exception:
+            value = None
+        if predicate(value):
+            return value
+        if time.monotonic() >= deadline:
+            return value
+        time.sleep(interval)
+
+
+# Mirrors tradingview-mcp's own known-good API paths (src/connection.js,
+# src/core/chart.js, src/core/ui.js) -- window.TradingViewApi
+# ._activeChartWidgetWV.value() for symbol()/resolution()/setSymbol()/
+# setResolution(), ..._chartWidget.model().mainSeries().bars() for OHLC bars,
+# and getSavedCharts()/loadChartFromServer() for switching saved layouts.
+_TV_BARS_JS = """
+(function() {
+    var w = window.TradingViewApi._activeChartWidgetWV.value();
+    var bars = w._chartWidget.model().mainSeries().bars();
+    if (!bars || typeof bars.lastIndex !== 'function') return null;
+    var result = [];
+    var end = bars.lastIndex();
+    var start = Math.max(bars.firstIndex(), end - 200 + 1);
+    for (var i = start; i <= end; i++) {
+        var v = bars.valueAt(i);
+        if (v) result.push({high: v[2], low: v[3], close: v[4]});
+    }
+    return {bars: result, symbol: w.symbol(), resolution: w.resolution()};
+})()
+"""
+
+_TV_GET_SYMBOL_RESOLUTION_JS = """
+(function() {
+    var chart = window.TradingViewApi._activeChartWidgetWV.value();
+    return { symbol: chart.symbol(), resolution: chart.resolution() };
+})()
+"""
+
+# symbol()/resolution() flip the instant setSymbol()/setResolution() is called,
+# but the underlying bar *data* keeps loading from TradingView's feed for a bit
+# after that -- reading bars right after the metadata matches can still return
+# the previous symbol's stale data. This combines symbol+resolution+the last
+# bar's index/close into one signature string; polling it until it stops
+# changing across consecutive reads (_tv_wait_for_stable_bars, below) means the
+# feed has actually caught up, not just the getter.
+_TV_BAR_SIGNATURE_JS = """
+(function() {
+    var w = window.TradingViewApi._activeChartWidgetWV.value();
+    var bars = w._chartWidget.model().mainSeries().bars();
+    if (!bars || typeof bars.lastIndex !== 'function') return null;
+    var end = bars.lastIndex();
+    var v = bars.valueAt(end);
+    return { sig: w.symbol() + '|' + w.resolution() + '|' + end + '|' + (v ? v[4] : 'null') + '|' + bars.size() };
+})()
+"""
+
+
+def _tv_wait_for_stable_bars(ws_url: str, stable_reads=3, interval=0.4, timeout=10):
+    """Poll the bar signature until it's identical across `stable_reads`
+    consecutive polls -- i.e. the feed has settled after a setSymbol/
+    setResolution call, not just that the API getters updated. Returns True if
+    it settled, False on timeout (caller proceeds anyway; a stale read is
+    better than hanging forever, and the caller can always retry)."""
+    deadline = time.monotonic() + timeout
+    last_sig = object()  # sentinel that can't equal any real signature
+    stable = 0
+    while True:
+        data = _tv_cdp_evaluate(ws_url, _TV_BAR_SIGNATURE_JS)
+        sig = (data or {}).get('sig')
+        if sig is not None and sig == last_sig:
+            stable += 1
+            if stable >= stable_reads:
+                return True
+        else:
+            stable = 0
+        last_sig = sig
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+def _tv_cdp_set_symbol(ws_url: str, symbol: str):
+    js = """
+    (function() {
+        var chart = window.TradingViewApi._activeChartWidgetWV.value();
+        chart.setSymbol(__SYMBOL__, {});
+        return true;
+    })()
+    """.replace('__SYMBOL__', json.dumps(symbol))
+    _tv_cdp_evaluate(ws_url, js)
+
+
+def _tv_cdp_set_resolution(ws_url: str, resolution: str):
+    js = """
+    (function() {
+        var chart = window.TradingViewApi._activeChartWidgetWV.value();
+        chart.setResolution(__RES__, {});
+        return true;
+    })()
+    """.replace('__RES__', json.dumps(resolution))
+    _tv_cdp_evaluate(ws_url, js)
+
+
+def fetch_atr_from_tradingview(symbol: str, period: int = ATR_PERIOD):
+    """Bring the live TradingView Desktop chart into a known-good state -- the
+    plan's symbol and the 1D timeframe -- actively correcting whichever
+    doesn't already match, then read OHLC bars and compute ATR from them.
+
+    Returns (atr_value, final_symbol, final_resolution, changes) where
+    `changes` is a list of human-readable strings describing what TALCS had
+    to correct (empty if the chart was already in the right state).
+
+    Raises RuntimeError if TradingView Desktop isn't reachable or the chart
+    never settles.
+    """
+    target = _tv_cdp_find_chart_target()
+    if not target:
+        raise RuntimeError(f"No TradingView chart tab found via CDP ({TV_CDP_HOST}:{TV_CDP_PORT}). "
+                            f"Is TradingView Desktop open with a chart?")
+    ws_url = target['webSocketDebuggerUrl']
+    changes = []
+
+    # No layout switching here: TradingView has a documented bug where switching
+    # between custom/saved layouts via the API doesn't reliably apply, confirmed
+    # by hands-on testing against the live app. The user manages the layout
+    # manually; TALCS only corrects symbol and timeframe, both of which were
+    # confirmed working.
+
+    state = _tv_poll_until(
+        lambda: _tv_cdp_evaluate(ws_url, _TV_GET_SYMBOL_RESOLUTION_JS),
+        lambda v: v is not None,
+        timeout=10, interval=0.5,
+    )
+    if not state:
+        raise RuntimeError("Could not read the TradingView chart's current symbol/resolution.")
+
+    # 1. Symbol -- correct if it doesn't match the plan's symbol.
+    changed_anything = False
+    if _bare_symbol(state.get('symbol')) != _bare_symbol(symbol):
+        old_symbol = state.get('symbol')
+        _tv_cdp_set_symbol(ws_url, symbol)
+        state = _tv_poll_until(
+            lambda: _tv_cdp_evaluate(ws_url, _TV_GET_SYMBOL_RESOLUTION_JS),
+            lambda v: v and _bare_symbol(v.get('symbol')) == _bare_symbol(symbol),
+            timeout=8, interval=0.4,
+        ) or state
+        changes.append(f"Changed TradingView chart symbol from {old_symbol} to {state.get('symbol')}")
+        changed_anything = True
+
+    # 2. Timeframe -- correct if not 1D.
+    if state.get('resolution') != TV_TARGET_RESOLUTION:
+        old_res = state.get('resolution')
+        _tv_cdp_set_resolution(ws_url, TV_TARGET_RESOLUTION)
+        state = _tv_poll_until(
+            lambda: _tv_cdp_evaluate(ws_url, _TV_GET_SYMBOL_RESOLUTION_JS),
+            lambda v: v and v.get('resolution') == TV_TARGET_RESOLUTION,
+            timeout=8, interval=0.4,
+        ) or state
+        changes.append(f"Changed TradingView timeframe from {old_res} to {TV_TARGET_RESOLUTION}")
+        changed_anything = True
+
+    # The symbol()/resolution() getters above confirm the API registered the
+    # change; they do NOT confirm the bar *data* has caught up (issue: fetching
+    # right after used to occasionally return the previous symbol's bars, fixed
+    # by waiting for the feed to settle here before reading anything).
+    if changed_anything:
+        _tv_wait_for_stable_bars(ws_url)
+
+    # 3. Read bars and compute ATR off the now-corrected chart.
+    data = _tv_cdp_evaluate(ws_url, _TV_BARS_JS)
+    if not data or not data.get('bars'):
+        raise RuntimeError("Could not read bars from the TradingView chart -- it may still be loading.")
+
+    df = pd.DataFrame(data['bars']).rename(columns={'high': 'High', 'low': 'Low', 'close': 'Close'})
+    atr_series = compute_atr(df, period).dropna()
+    if atr_series.empty:
+        raise RuntimeError("Not enough bars on the TradingView chart to compute ATR.")
+    return float(atr_series.iloc[-1]), data.get('symbol'), data.get('resolution'), changes
+
+
+def fetch_atr_from_yfinance(symbol: str, period: int = ATR_PERIOD):
+    """Fetch recent daily bars from Yahoo Finance and return (atr_value, ticker_used).
+    Tries the symbol as-is, then a `.TO` suffix (Wealthsimple/TSX listings often
+    don't map 1:1 to Yahoo tickers). Raises ValueError if no usable data is found."""
+    import yfinance as yf  # imported lazily -- only needed when this is actually called
+
+    candidates = [symbol]
+    if not symbol.upper().endswith(('.TO', '.V')):
+        candidates.append(f"{symbol}.TO")
+
+    for ticker in candidates:
+        try:
+            df = yf.download(ticker, period='3mo', interval='1d', progress=False, auto_adjust=False)
+        except Exception:
+            continue
+        if df is None or df.empty or len(df) < period + 1:
+            continue
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        atr_series = compute_atr(df, period).dropna()
+        if not atr_series.empty:
+            return float(atr_series.iloc[-1]), ticker
+
+    tried = f" (tried {', '.join(candidates)})" if len(candidates) > 1 else ""
+    raise ValueError(f"No usable daily price data found for '{symbol}'{tried}")
+
+
+def _bare_symbol(sym):
+    """Strip an exchange prefix (e.g. 'BATS:XLF' -> 'XLF') for comparison."""
+    return (sym or '').split(':')[-1].strip().upper()
+
+
+def fetch_atr(symbol: str, period: int = ATR_PERIOD):
+    """Try live TradingView Desktop first (actively correcting layout/symbol/
+    timeframe as needed), falling back to the Yahoo Finance proxy if
+    TradingView Desktop isn't reachable at all. Returns (atr_value,
+    source_note) where source_note describes where the value came from and
+    what, if anything, TALCS had to change on the TradingView chart to get it
+    (for display, not parsing)."""
+    try:
+        atr_value, tv_symbol, tv_resolution, changes = fetch_atr_from_tradingview(symbol, period)
+        note = f"TradingView Desktop, {tv_symbol} @ {tv_resolution}"
+        if changes:
+            note += " -- " + "; ".join(changes)
+        return atr_value, note
+    except Exception as tv_err:
+        try:
+            atr_value, ticker_used = fetch_atr_from_yfinance(symbol, period)
+            return atr_value, f"Yahoo Finance proxy ({ticker_used}, daily) -- TradingView Desktop unavailable: {tv_err}"
+        except Exception as yf_err:
+            raise RuntimeError(f"TradingView Desktop: {tv_err}. Yahoo Finance fallback also failed: {yf_err}")
 
 
 # ==============================================================
@@ -290,6 +670,7 @@ def match_plans_to_roundtrips(plans, round_trips_df, manual_matches=None):
     # Ignore overrides pointing at a round trip that no longer exists (e.g. executions
     # were deleted since the override was set).
     matches = {pid: rid for pid, rid in manual_matches.items() if rid in valid_rt_ids}
+    manual_plan_ids = set(matches.keys())
     used_rt_ids = set(matches.values())
 
     for (symbol, direction), rts in rt_by_key.items():
@@ -324,7 +705,9 @@ def match_plans_to_roundtrips(plans, round_trips_df, manual_matches=None):
     journal_rows = []
     for p in plans:
         rt = rt_lookup.get(matches.get(p['plan_id']))
-        journal_rows.append(build_journal_row(p, rt))
+        row = build_journal_row(p, rt)
+        row['manual_match'] = p['plan_id'] in manual_plan_ids
+        journal_rows.append(row)
 
     unmatched_rt_ids = []
     if round_trips_df is not None and not round_trips_df.empty:
@@ -455,6 +838,10 @@ def build_journal_row(plan, rt):
 
     # Blended planned exit price across active targets (weighted by qty_pct),
     # used to generalize the old single-take-profit "Plan Score" to multiple targets.
+    # This weighted average is only correct if qty_pct values are percentages of
+    # the SAME base (the original position size) -- e.g. 50/25/25, not a cascading
+    # "% of what's remaining" convention (50/50/100) that a scale-out strategy
+    # might otherwise suggest. See target_rows_form's helper text.
     active = [t for t in targets if t.get('price') not in (None, '') and t.get('qty_pct') not in (None, '', 0)]
     score = None
     if active and entry_planned not in (None, ''):
@@ -530,6 +917,7 @@ def _load_initial_state():
     executions_df = db.fetch_executions()
     round_trips_df, open_pos_df = build_round_trips(executions_df)
     plans = db.fetch_plans()
+    plan_matches = db.fetch_plan_matches()
 
     executions_out = executions_df.copy()
     if not executions_out.empty:
@@ -545,10 +933,11 @@ def _load_initial_state():
         op_out['since'] = op_out['since'].astype(str)
 
     return (executions_out.to_dict('records'), rt_out.to_dict('records'),
-            op_out.to_dict('records'), plans)
+            op_out.to_dict('records'), plans, plan_matches)
 
 
-INITIAL_EXECUTIONS, INITIAL_ROUNDTRIPS, INITIAL_OPENPOS, INITIAL_PLANS = _load_initial_state()
+(INITIAL_EXECUTIONS, INITIAL_ROUNDTRIPS, INITIAL_OPENPOS, INITIAL_PLANS,
+ INITIAL_PLAN_MATCHES) = _load_initial_state()
 
 
 def labeled(label, component, width=4):
@@ -558,28 +947,79 @@ def labeled(label, component, width=4):
 def target_rows_form(prefix):
     """Build the 5 optional price-target rows (Price / Qty % / Move Stop To)
     used in both the Add Plan form and the Edit modal. `prefix` is 'plan'
-    or 'edit' so the generated component ids don't collide."""
+    or 'edit' so the generated component ids don't collide. Each price field
+    carries a live '% from entry' readout next to it (see _pct_from_entry_js
+    callbacks) -- purely informational, recomputed whenever entry or the
+    field itself changes, including after a manual override."""
     rows = [
         html.P("Price Targets (up to 5, optional) — as each is hit, note where you'll move the "
                "protective stop.", className="text-muted small mb-1"),
+        html.P("Qty % is the share of your ORIGINAL position size to sell at that target, not the "
+               "share of whatever remains at that point. A 50% / 50% / 100% remaining-based scale-out "
+               "(sell half, then half of what's left, then the rest) is entered here as 50 / 25 / 25 "
+               "-- the Plan Score's weighted-average target price is only correct if these are "
+               "percentages of the same base and sum to ~100%.", className="text-muted small mb-1"),
         dbc.Row([
-            dbc.Col(html.Small("Target"), width=1), dbc.Col(html.Small("Price"), width=3),
-            dbc.Col(html.Small("Qty %"), width=3), dbc.Col(html.Small("Move Stop To"), width=4),
+            dbc.Col(html.Small("Target"), width=1), dbc.Col(html.Small("Price (% from entry)"), width=3),
+            dbc.Col(html.Small("Qty % (of original)"), width=3),
+            dbc.Col(html.Small("Move Stop To (% from entry)"), width=4),
         ], className="mb-1"),
     ]
     for i in range(1, db.MAX_TARGETS + 1):
         rows.append(dbc.Row([
             dbc.Col(html.Div(f"T{i}", className="pt-2"), width=1),
-            dbc.Col(dbc.Input(id=f'{prefix}-t{i}-price', type='number', size='sm'), width=3),
+            dbc.Col(dbc.InputGroup([
+                dbc.Input(id=f'{prefix}-t{i}-price', type='number', size='sm'),
+                dbc.InputGroupText("—", id=f'{prefix}-t{i}-price-pct'),
+            ]), width=3),
             dbc.Col(dbc.Input(id=f'{prefix}-t{i}-qty', type='number', size='sm', min=0, max=100), width=3),
-            dbc.Col(dbc.Input(id=f'{prefix}-t{i}-stop', type='number', size='sm'), width=4),
+            dbc.Col(dbc.InputGroup([
+                dbc.Input(id=f'{prefix}-t{i}-stop', type='number', size='sm'),
+                dbc.InputGroupText("—", id=f'{prefix}-t{i}-stop-pct'),
+            ]), width=4),
         ], className="mb-1"))
     return html.Div(rows)
 
 
+def atr_block(prefix):
+    """ATR-based stop/target helper, shared by the Add Plan form and Edit modal.
+
+    Fully automatic: entering/changing the symbol fetches ATR (live TradingView
+    Desktop, falling back to a Yahoo Finance proxy -- see fetch_atr), and
+    entry/ATR/multiplier changes recompute the stop and T1-T5 targets from it
+    (1R-6R spread) -- as long as Method is 'ATR-derived'. Switching Method to
+    'Manual override' freezes whatever is currently in the stop/target fields:
+    the auto-recompute callback checks this as a State and no-ops when it's
+    not 'atr', so a deliberate hand-edit (after flipping the radio) persists
+    through further symbol/entry changes and through commit."""
+    return html.Div([
+        html.P("ATR-Based Levels", className="fw-bold small mb-1"),
+        dbc.Row([
+            dbc.Col([
+                dbc.Label("ATR (14, daily)", size='sm'),
+                dbc.Input(id=f'{prefix}-atr', type='number', size='sm'),
+            ], width=4),
+            dbc.Col([
+                dbc.Label("Stop ATR ×", size='sm'),
+                dbc.Input(id=f'{prefix}-atr-mult', type='number', size='sm', value=1.5, step=0.1),
+            ], width=3),
+            dbc.Col([
+                dbc.Label("Method", size='sm'),
+                dbc.RadioItems(
+                    id=f'{prefix}-target-method', inline=True,
+                    options=[{'label': 'ATR-derived', 'value': 'atr'},
+                             {'label': 'Manual override', 'value': 'manual_override'}],
+                    value='atr'
+                ),
+            ], width=5),
+        ], className="mb-1 align-items-end"),
+        html.Div(id=f'{prefix}-atr-status', className="text-muted small mb-2"),
+    ])
+
+
 plan_form = dbc.Form([
     dbc.Row([
-        labeled("Symbol *", dbc.Input(id='plan-symbol', placeholder="e.g. ARKK"), 4),
+        labeled("Symbol *", dbc.Input(id='plan-symbol', placeholder="e.g. ARKK", debounce=True), 4),
         labeled("Direction *", dbc.Select(
             id='plan-direction',
             options=[{'label': 'Long (BUY)', 'value': 'BUY'}, {'label': 'Short (SELL)', 'value': 'SELL'}],
@@ -590,12 +1030,19 @@ plan_form = dbc.Form([
         ), 4),
     ], className="mb-2"),
     dbc.Row([
-        labeled("Entry Price *", dbc.Input(id='plan-entry', type='number'), 6),
-        labeled("Initial Protective Stop (optional)", dbc.Input(id='plan-stop', type='number'), 6),
+        labeled("Entry Price *", dbc.Input(id='plan-entry', type='number', debounce=True), 6),
+        dbc.Col([
+            dbc.Label("Initial Protective Stop (optional)"),
+            dbc.InputGroup([
+                dbc.Input(id='plan-stop', type='number'),
+                dbc.InputGroupText("—", id='plan-stop-pct'),
+            ]),
+        ], width=6),
     ], className="mb-2"),
     dbc.Row([
         labeled("Quantity *", dbc.Input(id='plan-qty', type='number'), 6),
     ], className="mb-2"),
+    dbc.Row([dbc.Col([atr_block('plan')], width=12)], className="mb-2"),
     dbc.Row([dbc.Col([target_rows_form('plan')], width=12)], className="mb-2"),
     dbc.Row([
         labeled("Reason / Setup (optional)", dbc.Textarea(id='plan-reason', rows=3,
@@ -604,7 +1051,12 @@ plan_form = dbc.Form([
     dbc.Row([
         labeled("Notes (optional)", dbc.Textarea(id='plan-notes', rows=2), 12),
     ], className="mb-2"),
-    dbc.Button("Add Trade Plan", id='btn-add-plan', color='primary'),
+    dbc.ButtonGroup([
+        dbc.Button("Save as Draft", id='btn-save-draft', color='secondary', outline=True),
+        dbc.Button("Commit Plan", id='btn-add-plan', color='primary'),
+    ]),
+    html.P("A draft can be freely edited; committing finalizes the plan for execution matching.",
+           className="text-muted small mt-1 mb-0"),
     html.Div(id='plan-add-status', className="mt-2"),
 ])
 
@@ -617,6 +1069,8 @@ app.layout = dbc.Container([
     dcc.Store(id='store-unmatched-rts', storage_type='memory', data=[]),
     dcc.Store(id='store-editing-plan-id', storage_type='memory'),
     dcc.Store(id='store-pending-delete-plan', storage_type='memory'),
+    dcc.Store(id='store-plan-matches', storage_type='memory', data=INITIAL_PLAN_MATCHES),
+    dcc.Store(id='store-matching-plan-id', storage_type='memory'),
     dcc.Download(id='download-journal'),
 
     # ---- Edit-plan modal ----
@@ -624,7 +1078,7 @@ app.layout = dbc.Container([
         dbc.ModalHeader(dbc.ModalTitle("Edit Trade Plan")),
         dbc.ModalBody([
             dbc.Row([
-                labeled("Symbol *", dbc.Input(id='edit-symbol'), 4),
+                labeled("Symbol *", dbc.Input(id='edit-symbol', debounce=True), 4),
                 labeled("Direction *", dbc.Select(
                     id='edit-direction',
                     options=[{'label': 'Long (BUY)', 'value': 'BUY'}, {'label': 'Short (SELL)', 'value': 'SELL'}],
@@ -632,10 +1086,17 @@ app.layout = dbc.Container([
                 labeled("Planned Date", dcc.DatePickerSingle(id='edit-date', display_format='YYYY-MM-DD'), 4),
             ], className="mb-2"),
             dbc.Row([
-                labeled("Entry Price *", dbc.Input(id='edit-entry', type='number'), 6),
-                labeled("Initial Protective Stop", dbc.Input(id='edit-stop', type='number'), 6),
+                labeled("Entry Price *", dbc.Input(id='edit-entry', type='number', debounce=True), 6),
+                dbc.Col([
+                    dbc.Label("Initial Protective Stop"),
+                    dbc.InputGroup([
+                        dbc.Input(id='edit-stop', type='number'),
+                        dbc.InputGroupText("—", id='edit-stop-pct'),
+                    ]),
+                ], width=6),
             ], className="mb-2"),
             dbc.Row([labeled("Quantity *", dbc.Input(id='edit-qty', type='number'), 6)], className="mb-2"),
+            dbc.Row([dbc.Col([atr_block('edit')], width=12)], className="mb-2"),
             dbc.Row([dbc.Col([target_rows_form('edit')], width=12)], className="mb-2"),
             dbc.Row([labeled("Reason / Setup", dbc.Textarea(id='edit-reason', rows=3), 12)], className="mb-2"),
             dbc.Row([labeled("Notes", dbc.Textarea(id='edit-notes', rows=2), 12)], className="mb-2"),
@@ -646,6 +1107,23 @@ app.layout = dbc.Container([
             dbc.Button("Save Changes", id='btn-edit-save', color='primary'),
         ]),
     ], id='edit-modal', is_open=False),
+
+    # ---- Manual plan<->round-trip match override modal ----
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("Match Plan to Executed Round Trip")),
+        dbc.ModalBody([
+            html.P("The auto-matcher picks the nearest-in-time round trip for the same symbol and "
+                   "direction. Pick a different one here to correct it, or clear it to fall back to "
+                   "auto-matching.", className="text-muted small"),
+            dbc.Select(id='match-rt-select', options=[], value=None),
+            html.Div(id='match-status', className="mt-2"),
+        ]),
+        dbc.ModalFooter([
+            dbc.Button("Cancel", id='btn-match-cancel', color='secondary'),
+            dbc.Button("Clear Match", id='btn-match-clear', color='outline-danger'),
+            dbc.Button("Save Match", id='btn-match-save', color='primary'),
+        ]),
+    ], id='match-modal', is_open=False),
 
     dcc.ConfirmDialog(id='confirm-delete-plan'),
     dcc.ConfirmDialog(id='confirm-clear-plans',
@@ -690,11 +1168,52 @@ app.layout = dbc.Container([
 
     dbc.Row([dbc.Col([
         dbc.Card([
+            dbc.CardHeader("Draft Trade Plans (not yet committed)"),
+            dbc.CardBody([
+                html.P("Drafts are excluded from the journal and execution matching until committed.",
+                       className="text-muted small"),
+                html.Div(id='draft-plans-list')
+            ])
+        ])
+    ])], className="mt-3"),
+
+    dbc.Row([dbc.Col([
+        dbc.Card([
             dbc.CardHeader("Executed Trades Without a Plan"),
             dbc.CardBody([
                 html.P("These round-trip trades were found in your import but don't have a matching plan yet. "
-                       "Click \"Log Plan\" to pre-fill the form above.", className="text-muted small"),
-                html.Div(id='unmatched-roundtrips')
+                       "Select a row and click \"Log Plan for Selected Trade\" to pre-fill the form above.",
+                       className="text-muted small"),
+                dash_table.DataTable(
+                    id='unmatched-rt-table',
+                    columns=[
+                        {'name': 'Symbol', 'id': 'symbol'},
+                        {'name': 'Entry', 'id': 'entry_price', 'type': 'numeric', 'format': {'specifier': '.2f'}},
+                        {'name': 'Exit', 'id': 'exit_price', 'type': 'numeric', 'format': {'specifier': '.2f'}},
+                        {'name': 'Qty', 'id': 'qty', 'type': 'numeric', 'format': {'specifier': '.4~g'}},
+                        {'name': 'P&L', 'id': 'realized_pnl', 'type': 'numeric', 'format': {'specifier': '.2f'}},
+                        {'name': 'Currency', 'id': 'currency'},
+                        {'name': 'Exit Date', 'id': 'exit_time'},
+                    ],
+                    data=[],
+                    row_selectable='single',
+                    selected_rows=[],
+                    sort_action='native',
+                    filter_action='native',
+                    page_size=10,
+                    style_table={'overflowX': 'auto'},
+                    style_cell={'textAlign': 'left', 'padding': '6px'},
+                    style_header={'fontWeight': 'bold'},
+                    style_data_conditional=[
+                        {'if': {'filter_query': '{realized_pnl} >= 0', 'column_id': 'realized_pnl'},
+                         'color': '#198754'},
+                        {'if': {'filter_query': '{realized_pnl} < 0', 'column_id': 'realized_pnl'},
+                         'color': '#dc3545'},
+                    ],
+                ),
+                dbc.Button("Log Plan for Selected Trade", id='btn-log-selected-plan', color='outline-primary',
+                           size='sm', className="mt-2"),
+                html.Div(id='unmatched-rt-status', className="mt-2"),
             ])
         ])
     ])], className="mt-3"),
@@ -859,29 +1378,136 @@ def targets_to_row_values(targets):
     return out
 
 
+def _fmt_pct(entry, value):
+    """'% from entry' display string for one price field, or '—' if either
+    side is missing/unparseable. Plain (value-entry)/entry -- not a
+    favorable/adverse transform -- since this is just describing distance,
+    not judging it."""
+    try:
+        if entry in (None, '') or value in (None, ''):
+            return "—"
+        entry_f, value_f = float(entry), float(value)
+        if entry_f == 0:
+            return "—"
+        return f"{(value_f - entry_f) / entry_f * 100:+.1f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def register_atr_callbacks(prefix):
+    """Wire the automatic ATR/target behavior of atr_block(prefix) and the
+    live '% from entry' readouts of target_rows_form(prefix), for either the
+    Add Plan form ('plan') or the Edit modal ('edit') -- both use the same id
+    scheme. Two reactive stages, chained through the ATR field:
+
+    1. Symbol changes (debounced on the input) -> fetch ATR automatically.
+    2. Entry / ATR value / ATR multiplier changes -> recompute stop + T1-T5
+       from ATR, but ONLY while Method is 'atr' -- checked as a State, so it
+       never fires from its own writes, and a user who flips Method to
+       'Manual override' first can hand-edit stop/targets without them being
+       silently recomputed out from under the edit.
+
+    A third, independent callback keeps the '% from entry' labels current
+    for every price field, including hand-edited ones.
+    """
+
+    @app.callback(
+        [Output(f'{prefix}-atr', 'value', allow_duplicate=True),
+         Output(f'{prefix}-atr-status', 'children', allow_duplicate=True)],
+        Input(f'{prefix}-symbol', 'value'),
+        prevent_initial_call=True,
+    )
+    def _auto_fetch_atr(symbol, prefix=prefix):
+        if not symbol or not symbol.strip():
+            raise PreventUpdate
+        try:
+            atr_value, source_note = fetch_atr(symbol.strip().upper())
+        except Exception as e:
+            return no_update, dbc.Alert(f"Couldn't fetch ATR: {e}. Enter it manually.", color='warning')
+        # 'Yahoo Finance proxy' = fell all the way back (flag it); 'Changed'
+        # = TradingView was corrected to fetch this (worth noticing, not alarming);
+        # otherwise the chart was already in the right state.
+        if 'Yahoo Finance proxy' in source_note:
+            color = 'warning'
+        elif 'Changed' in source_note:
+            color = 'success'
+        else:
+            color = 'info'
+        note = f"ATR({ATR_PERIOD}) = {atr_value:.4f} -- source: {source_note}"
+        return round(atr_value, 4), dbc.Alert(note, color=color)
+
+    @app.callback(
+        [Output(f'{prefix}-stop', 'value', allow_duplicate=True)] +
+        [Output(f'{prefix}-t{i}-price', 'value', allow_duplicate=True) for i in range(1, db.MAX_TARGETS + 1)],
+        [Input(f'{prefix}-entry', 'value'), Input(f'{prefix}-direction', 'value'),
+         Input(f'{prefix}-atr', 'value'), Input(f'{prefix}-atr-mult', 'value')],
+        State(f'{prefix}-target-method', 'value'),
+        prevent_initial_call=True,
+    )
+    def _auto_apply_stop_targets(entry, direction, atr_value, mult, target_method, prefix=prefix):
+        if target_method != 'atr' or entry in (None, '') or atr_value in (None, ''):
+            raise PreventUpdate
+        try:
+            entry_f, atr_f = float(entry), float(atr_value)
+        except (TypeError, ValueError):
+            raise PreventUpdate
+        mult = float(mult) if mult not in (None, '') else 1.5
+        sign = 1 if direction == 'BUY' else -1
+
+        stop = round(entry_f - sign * atr_f * mult, 4)
+        # Default 1R -> 6R spread across MAX_TARGETS levels, per CLAUDE.md's Sniper indicator design.
+        multiples = np.linspace(1, 6, db.MAX_TARGETS)
+        targets = [round(entry_f + sign * m * atr_f, 4) for m in multiples]
+        return [stop] + targets
+
+    @app.callback(
+        [Output(f'{prefix}-stop-pct', 'children')] +
+        [Output(f'{prefix}-t{i}-price-pct', 'children') for i in range(1, db.MAX_TARGETS + 1)] +
+        [Output(f'{prefix}-t{i}-stop-pct', 'children') for i in range(1, db.MAX_TARGETS + 1)],
+        [Input(f'{prefix}-entry', 'value'), Input(f'{prefix}-stop', 'value')] +
+        [Input(f'{prefix}-t{i}-price', 'value') for i in range(1, db.MAX_TARGETS + 1)] +
+        [Input(f'{prefix}-t{i}-stop', 'value') for i in range(1, db.MAX_TARGETS + 1)],
+    )
+    def _update_pct_labels(entry, stop, *target_vals, prefix=prefix):
+        prices = target_vals[0:db.MAX_TARGETS]
+        stops = target_vals[db.MAX_TARGETS:2 * db.MAX_TARGETS]
+        return ([_fmt_pct(entry, stop)] +
+                [_fmt_pct(entry, p) for p in prices] +
+                [_fmt_pct(entry, s) for s in stops])
+
+
+register_atr_callbacks('plan')
+register_atr_callbacks('edit')
+
+
 @app.callback(
     [Output('store-plans', 'data'), Output('plan-add-status', 'children'),
      Output('plan-symbol', 'value'), Output('plan-entry', 'value'),
      Output('plan-stop', 'value'), Output('plan-qty', 'value'),
-     Output('plan-reason', 'value'), Output('plan-notes', 'value')] +
+     Output('plan-reason', 'value'), Output('plan-notes', 'value'),
+     Output('plan-atr', 'value'), Output('plan-atr-status', 'children')] +
     [Output(f'plan-t{i}-price', 'value') for i in range(1, db.MAX_TARGETS + 1)] +
     [Output(f'plan-t{i}-qty', 'value') for i in range(1, db.MAX_TARGETS + 1)] +
     [Output(f'plan-t{i}-stop', 'value') for i in range(1, db.MAX_TARGETS + 1)],
-    Input('btn-add-plan', 'n_clicks'),
+    [Input('btn-add-plan', 'n_clicks'), Input('btn-save-draft', 'n_clicks')],
     [State('plan-symbol', 'value'), State('plan-direction', 'value'),
      State('plan-date', 'date'), State('plan-entry', 'value'),
      State('plan-stop', 'value'), State('plan-qty', 'value'),
-     State('plan-reason', 'value'), State('plan-notes', 'value'), State('store-plans', 'data')] +
+     State('plan-reason', 'value'), State('plan-notes', 'value'),
+     State('plan-atr', 'value'), State('plan-atr-mult', 'value'), State('plan-target-method', 'value'),
+     State('store-plans', 'data')] +
     [State(f'plan-t{i}-price', 'value') for i in range(1, db.MAX_TARGETS + 1)] +
     [State(f'plan-t{i}-qty', 'value') for i in range(1, db.MAX_TARGETS + 1)] +
     [State(f'plan-t{i}-stop', 'value') for i in range(1, db.MAX_TARGETS + 1)],
     prevent_initial_call=True,
 )
-def add_plan(n_clicks, symbol, direction, planned_date, entry, stop, qty, reason, notes, plans, *target_vals):
-    if not n_clicks:
+def add_plan(n_add, n_draft, symbol, direction, planned_date, entry, stop, qty, reason, notes,
+             atr_value, atr_mult, target_method, plans, *target_vals):
+    if not n_add and not n_draft:
         raise PreventUpdate
     plans = plans or []
-    n_blank_outputs = 8 + 3 * db.MAX_TARGETS
+    n_blank_outputs = 10 + 3 * db.MAX_TARGETS
+    plan_status = 'draft' if callback_context.triggered_id == 'btn-save-draft' else 'committed'
 
     if not symbol or not direction or entry in (None, '') or qty in (None, ''):
         status = dbc.Alert("Symbol, Direction, Entry Price and Quantity are required.", color='danger')
@@ -898,23 +1524,30 @@ def add_plan(n_clicks, symbol, direction, planned_date, entry, stop, qty, reason
     targets = build_targets_list(*flat)
 
     symbol = symbol.strip().upper()
+    now = dt.datetime.utcnow().isoformat()
     plan = {
         'plan_id': str(uuid.uuid4())[:8],
         'symbol': symbol,
         'direction': direction,
         'planned_date': planned_date,
-        'created_at': dt.datetime.utcnow().isoformat(),
+        'created_at': now,
         'entry_price': float(entry),
         'stop_loss': float(stop) if stop not in (None, '') else None,
         'targets': targets,
         'qty': float(qty),
         'reason': reason or '',
         'notes': notes or '',
+        'status': plan_status,
+        'committed_at': now if plan_status == 'committed' else None,
+        'target_method': target_method,
+        'atr_at_commit': float(atr_value) if atr_value not in (None, '') else None,
+        'atr_multiplier': float(atr_mult) if atr_mult not in (None, '') else None,
     }
     db.insert_plan(plan)
     plans = plans + [plan]
-    status = dbc.Alert(f"✅ Plan added for {symbol} ({direction}) and saved to the database.", color='success')
-    return (plans, status, '', None, None, None, '', '') + (None,) * (3 * db.MAX_TARGETS)
+    verb = "saved as a draft" if plan_status == 'draft' else "committed and saved to the database"
+    status = dbc.Alert(f"✅ Plan for {symbol} ({direction}) {verb}.", color='success')
+    return (plans, status, '', None, None, None, '', '', None, '') + (None,) * (3 * db.MAX_TARGETS)
 
 
 @app.callback(
@@ -922,39 +1555,101 @@ def add_plan(n_clicks, symbol, direction, planned_date, entry, stop, qty, reason
      Output('plan-direction', 'value', allow_duplicate=True),
      Output('plan-entry', 'value', allow_duplicate=True),
      Output('plan-qty', 'value', allow_duplicate=True),
-     Output('plan-notes', 'value', allow_duplicate=True)],
-    Input({'type': 'btn-log-plan', 'index': ALL}, 'n_clicks'),
-    State('store-roundtrips', 'data'),
+     Output('plan-notes', 'value', allow_duplicate=True),
+     Output('unmatched-rt-status', 'children')],
+    Input('btn-log-selected-plan', 'n_clicks'),
+    [State('unmatched-rt-table', 'derived_virtual_data'),
+     State('unmatched-rt-table', 'derived_virtual_selected_rows')],
     prevent_initial_call=True,
 )
-def prefill_plan_from_roundtrip(n_clicks_list, roundtrips):
+def prefill_plan_from_roundtrip(n_clicks, virtual_data, selected_rows):
+    if not n_clicks:
+        raise PreventUpdate
+    if not selected_rows or not virtual_data:
+        return (no_update, no_update, no_update, no_update, no_update,
+                dbc.Alert("Select a row in the table first.", color='warning'))
+    # derived_virtual_* reflects the table's current sort/filter view, so the
+    # selected index maps correctly even when the user has sorted or filtered it.
+    rt = virtual_data[selected_rows[0]]
+    note = (f"Logged retroactively from import. Actual entry {rt['entry_price']:.2f}, "
+            f"exit {rt['exit_price']:.2f}, qty {rt['qty']:.4g}. Set your intended stop/target below.")
+    return rt['symbol'], rt['direction'], round(rt['entry_price'], 4), round(rt['qty'], 4), note, ''
+
+
+@app.callback(
+    Output('draft-plans-list', 'children'),
+    Input('store-plans', 'data'),
+)
+def render_draft_plans(plans):
+    drafts = [p for p in (plans or []) if p.get('status') == 'draft']
+    if not drafts:
+        return html.P("None.", className="text-muted")
+    header = dbc.Row([
+        dbc.Col(html.B("Symbol"), width=2), dbc.Col(html.B("Dir"), width=1),
+        dbc.Col(html.B("Entry"), width=2), dbc.Col(html.B("Qty"), width=2),
+        dbc.Col(html.B("Method"), width=2), dbc.Col(html.B(""), width=3),
+    ], className="mb-1")
+    rows = [header]
+    for p in drafts:
+        actions = dbc.ButtonGroup([
+            dbc.Button("Edit", size='sm', color='primary', outline=True,
+                       id={'type': 'btn-edit', 'index': p['plan_id']}),
+            dbc.Button("Commit", size='sm', color='success', outline=True,
+                       id={'type': 'btn-draft-commit', 'index': p['plan_id']}),
+            dbc.Button("Discard", size='sm', color='danger', outline=True,
+                       id={'type': 'btn-delete', 'index': p['plan_id']}),
+        ])
+        rows.append(dbc.Row([
+            dbc.Col(p['symbol'], width=2), dbc.Col(p['direction'], width=1),
+            dbc.Col(f"{p['entry_price']:.2f}", width=2), dbc.Col(f"{p['qty']:.4g}", width=2),
+            dbc.Col(p.get('target_method') or '-', width=2), dbc.Col(actions, width=3),
+        ], className="mb-1 align-items-center"))
+    return rows
+
+
+@app.callback(
+    [Output('store-plans', 'data', allow_duplicate=True),
+     Output('plan-add-status', 'children', allow_duplicate=True)],
+    Input({'type': 'btn-draft-commit', 'index': ALL}, 'n_clicks'),
+    State('store-plans', 'data'),
+    prevent_initial_call=True,
+)
+def commit_draft_plan(n_clicks_list, plans):
     if not any(n_clicks_list or []):
         raise PreventUpdate
     triggered = callback_context.triggered_id
     if not triggered:
         raise PreventUpdate
-    rt_id = triggered['index']
-    rt_lookup = {r['rt_id']: r for r in (roundtrips or [])}
-    rt = rt_lookup.get(rt_id)
-    if not rt:
+    plan_id = triggered['index']
+    now = dt.datetime.utcnow().isoformat()
+    if not db.update_plan(plan_id, {'status': 'committed', 'committed_at': now}):
         raise PreventUpdate
-    note = (f"Logged retroactively from import. Actual entry {rt['entry_price']:.2f}, "
-            f"exit {rt['exit_price']:.2f}, qty {rt['qty']:.4g}. Set your intended stop/target below.")
-    return rt['symbol'], rt['direction'], round(rt['entry_price'], 4), round(rt['qty'], 4), note
+
+    new_plans = []
+    for p in (plans or []):
+        if p['plan_id'] == plan_id:
+            p = dict(p)
+            p['status'] = 'committed'
+            p['committed_at'] = now
+        new_plans.append(p)
+    status = dbc.Alert("✅ Draft committed -- now eligible for execution matching.", color='success')
+    return new_plans, status
 
 
 @app.callback(
     [Output('store-journal', 'data'), Output('store-unmatched-rts', 'data')],
-    [Input('store-plans', 'data'), Input('store-roundtrips', 'data')],
+    [Input('store-plans', 'data'), Input('store-roundtrips', 'data'), Input('store-plan-matches', 'data')],
 )
-def compute_journal(plans, roundtrips):
-    plans = plans or []
+def compute_journal(plans, roundtrips, plan_matches):
+    # Drafts aren't finalized yet -- keep them out of the scored journal and out of
+    # execution matching until committed (see the Draft Trade Plans card).
+    plans = [p for p in (plans or []) if p.get('status') == 'committed']
     rt_df = pd.DataFrame(roundtrips) if roundtrips else pd.DataFrame()
     if not rt_df.empty:
         rt_df['entry_time'] = pd.to_datetime(rt_df['entry_time'], utc=True)
         rt_df['exit_time'] = pd.to_datetime(rt_df['exit_time'], utc=True)
 
-    journal_rows, unmatched_rt_ids = match_plans_to_roundtrips(plans, rt_df)
+    journal_rows, unmatched_rt_ids = match_plans_to_roundtrips(plans, rt_df, plan_matches)
 
     for row in journal_rows:
         if row.get('entry_time') is not None:
@@ -971,32 +1666,22 @@ def compute_journal(plans, roundtrips):
 
 
 @app.callback(
-    Output('unmatched-roundtrips', 'children'),
+    [Output('unmatched-rt-table', 'data'), Output('unmatched-rt-table', 'selected_rows')],
     Input('store-unmatched-rts', 'data'),
 )
 def render_unmatched_roundtrips(data):
     if not data:
-        return html.P("None — every executed round-trip trade has a matching plan.", className="text-muted")
+        return [], []
     df = pd.DataFrame(data).sort_values('exit_time', ascending=False)
-    header = dbc.Row([
-        dbc.Col(html.B("Symbol"), width=2), dbc.Col(html.B("Entry"), width=2),
-        dbc.Col(html.B("Exit"), width=2), dbc.Col(html.B("Qty"), width=2),
-        dbc.Col(html.B("P&L"), width=2), dbc.Col(html.B(""), width=2),
-    ], className="mb-1")
-    rows = [header]
-    for _, r in df.iterrows():
-        pnl = r['realized_pnl']
-        pnl_color = 'text-success' if pnl >= 0 else 'text-danger'
-        rows.append(dbc.Row([
-            dbc.Col(r['symbol'], width=2),
-            dbc.Col(f"{r['currency']} {r['entry_price']:.2f}", width=2),
-            dbc.Col(f"{r['currency']} {r['exit_price']:.2f}", width=2),
-            dbc.Col(f"{r['qty']:.4g}", width=2),
-            dbc.Col(f"{r['currency']} {pnl:.2f}", width=2, className=pnl_color),
-            dbc.Col(dbc.Button("Log Plan", size='sm', color='outline-primary',
-                                id={'type': 'btn-log-plan', 'index': r['rt_id']}), width=2),
-        ], className="mb-1 align-items-center"))
-    return rows
+    df['exit_time'] = df['exit_time'].str[:10]  # date only, full timestamp is noise in the table
+    # DataTable's `data` prop requires every cell to be a string/number/boolean --
+    # exit_fill_list is a list of {qty, price, time} dicts and must be dropped
+    # (it's not needed for the "Log Plan" prefill, which only reads the columns below).
+    df = df.drop(columns=['exit_fill_list'], errors='ignore')
+    # rt_id rides along in each record for the "Log Plan" callback below, even
+    # though it's not in the table's `columns` (DataTable only *displays*
+    # listed columns; unlisted keys stay on the record and survive sort/filter).
+    return df.to_dict('records'), []
 
 
 @app.callback(
@@ -1057,11 +1742,16 @@ def render_journal(data, symbol_filter, score_range):
         actions = dbc.ButtonGroup([
             dbc.Button("View", size='sm', color='secondary', outline=True,
                        id={'type': 'btn-view', 'index': r['plan_id']}),
+            dbc.Button("Match", size='sm', color='info', outline=True,
+                       id={'type': 'btn-match', 'index': r['plan_id']}),
             dbc.Button("Edit", size='sm', color='primary', outline=True,
                        id={'type': 'btn-edit', 'index': r['plan_id']}),
             dbc.Button("Del", size='sm', color='danger', outline=True,
                        id={'type': 'btn-delete', 'index': r['plan_id']}),
         ])
+        status_disp = [r['status']]
+        if r.get('manual_match'):
+            status_disp.append(html.Span(" (manual match)", className="text-muted small"))
         rows.append(dbc.Row([
             dbc.Col(r['symbol'], width=1),
             dbc.Col(r['direction'], width=1),
@@ -1071,7 +1761,7 @@ def render_journal(data, symbol_filter, score_range):
             dbc.Col(r_disp, width=1),
             dbc.Col(score_disp, width=1),
             dbc.Col(targets_disp, width=1),
-            dbc.Col(r['status'], width=1),
+            dbc.Col(status_disp, width=1),
             dbc.Col(actions, width=2),
         ], className="mb-1 align-items-center"))
     return rows
@@ -1153,7 +1843,7 @@ def show_detail(n_clicks_list, data):
     if target_results:
         header = dbc.Row([
             dbc.Col(html.B("#"), width=1), dbc.Col(html.B("Planned Price"), width=2),
-            dbc.Col(html.B("Qty %"), width=1), dbc.Col(html.B("Move Stop To"), width=2),
+            dbc.Col(html.B("Qty % (of original)"), width=1), dbc.Col(html.B("Move Stop To"), width=2),
             dbc.Col(html.B("Hit?"), width=1), dbc.Col(html.B("Actual Fill"), width=3),
             dbc.Col(html.B("Stop After"), width=2),
         ], className="mb-1")
@@ -1258,7 +1948,9 @@ def export_journal(n_clicks, data):
      Output('edit-date', 'date'), Output('edit-entry', 'value'),
      Output('edit-stop', 'value'), Output('edit-qty', 'value'),
      Output('edit-reason', 'value'), Output('edit-notes', 'value'),
-     Output('edit-status', 'children')] +
+     Output('edit-status', 'children'),
+     Output('edit-atr', 'value'), Output('edit-atr-mult', 'value'),
+     Output('edit-target-method', 'value'), Output('edit-atr-status', 'children')] +
     [Output(f'edit-t{i}-price', 'value') for i in range(1, db.MAX_TARGETS + 1)] +
     [Output(f'edit-t{i}-qty', 'value') for i in range(1, db.MAX_TARGETS + 1)] +
     [Output(f'edit-t{i}-stop', 'value') for i in range(1, db.MAX_TARGETS + 1)],
@@ -1284,7 +1976,9 @@ def open_edit_modal(n_clicks_list, plans):
     stops = target_row_vals[2::3]
     return (True, plan_id, plan['symbol'], plan['direction'], plan.get('planned_date'),
             plan['entry_price'], plan.get('stop_loss'), plan['qty'],
-            plan.get('reason', ''), plan.get('notes', ''), '') + tuple(prices) + tuple(qtys) + tuple(stops)
+            plan.get('reason', ''), plan.get('notes', ''), '',
+            plan.get('atr_at_commit'), plan.get('atr_multiplier') or 1.5,
+            plan.get('target_method') or 'atr', '') + tuple(prices) + tuple(qtys) + tuple(stops)
 
 
 @app.callback(
@@ -1307,6 +2001,7 @@ def cancel_edit(n_clicks):
      State('edit-direction', 'value'), State('edit-date', 'date'),
      State('edit-entry', 'value'), State('edit-stop', 'value'),
      State('edit-qty', 'value'), State('edit-reason', 'value'), State('edit-notes', 'value'),
+     State('edit-atr', 'value'), State('edit-atr-mult', 'value'), State('edit-target-method', 'value'),
      State('store-plans', 'data')] +
     [State(f'edit-t{i}-price', 'value') for i in range(1, db.MAX_TARGETS + 1)] +
     [State(f'edit-t{i}-qty', 'value') for i in range(1, db.MAX_TARGETS + 1)] +
@@ -1314,7 +2009,7 @@ def cancel_edit(n_clicks):
     prevent_initial_call=True,
 )
 def save_edit(n_clicks, plan_id, symbol, direction, planned_date, entry, stop, qty,
-              reason, notes, plans, *target_vals):
+              reason, notes, atr_value, atr_mult, target_method, plans, *target_vals):
     if not n_clicks or not plan_id:
         raise PreventUpdate
     if not symbol or not direction or entry in (None, '') or qty in (None, ''):
@@ -1339,6 +2034,9 @@ def save_edit(n_clicks, plan_id, symbol, direction, planned_date, entry, stop, q
         'qty': float(qty),
         'reason': reason or '',
         'notes': notes or '',
+        'target_method': target_method,
+        'atr_at_commit': float(atr_value) if atr_value not in (None, '') else None,
+        'atr_multiplier': float(atr_mult) if atr_mult not in (None, '') else None,
     }
     db.update_plan(plan_id, fields)
 
@@ -1352,6 +2050,86 @@ def save_edit(n_clicks, plan_id, symbol, direction, planned_date, entry, stop, q
 
     status = dbc.Alert(f"✅ Plan for {fields['symbol']} updated and saved to the database.", color='success')
     return new_plans, False, status
+
+
+@app.callback(
+    [Output('match-modal', 'is_open'), Output('store-matching-plan-id', 'data'),
+     Output('match-rt-select', 'options'), Output('match-rt-select', 'value'),
+     Output('match-status', 'children')],
+    Input({'type': 'btn-match', 'index': ALL}, 'n_clicks'),
+    [State('store-plans', 'data'), State('store-roundtrips', 'data'), State('store-plan-matches', 'data')],
+    prevent_initial_call=True,
+)
+def open_match_modal(n_clicks_list, plans, roundtrips, plan_matches):
+    if not any(n_clicks_list or []):
+        raise PreventUpdate
+    triggered = callback_context.triggered_id
+    if not triggered:
+        raise PreventUpdate
+    plan_id = triggered['index']
+    plan = next((p for p in (plans or []) if p['plan_id'] == plan_id), None)
+    if not plan:
+        raise PreventUpdate
+
+    candidates = [rt for rt in (roundtrips or [])
+                  if rt['symbol'] == plan['symbol'] and rt['direction'] == plan['direction']]
+    candidates.sort(key=lambda rt: rt['exit_time'], reverse=True)
+    options = [{
+        'label': (f"{rt['entry_time'][:10]} → {rt['exit_time'][:10]}  "
+                  f"{rt['entry_price']:.2f}→{rt['exit_price']:.2f}  qty {rt['qty']:.4g}"),
+        'value': rt['rt_id'],
+    } for rt in candidates]
+    current_rt_id = (plan_matches or {}).get(plan_id)
+
+    note = html.Small(f"{len(candidates)} round trip(s) found for {plan['symbol']} ({plan['direction']}).",
+                       className="text-muted")
+    return True, plan_id, options, current_rt_id, note
+
+
+@app.callback(
+    Output('match-modal', 'is_open', allow_duplicate=True),
+    Input('btn-match-cancel', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def cancel_match(n_clicks):
+    if not n_clicks:
+        raise PreventUpdate
+    return False
+
+
+@app.callback(
+    [Output('store-plan-matches', 'data', allow_duplicate=True),
+     Output('match-modal', 'is_open', allow_duplicate=True)],
+    Input('btn-match-save', 'n_clicks'),
+    [State('store-matching-plan-id', 'data'), State('match-rt-select', 'value'),
+     State('store-plan-matches', 'data')],
+    prevent_initial_call=True,
+)
+def save_match(n_clicks, plan_id, rt_id, plan_matches):
+    if not n_clicks or not plan_id or not rt_id:
+        raise PreventUpdate
+    db.set_plan_match(plan_id, rt_id)
+    plan_matches = dict(plan_matches or {})
+    # A round trip can only be claimed by one plan -- drop it from whoever had it before.
+    plan_matches = {pid: rid for pid, rid in plan_matches.items() if rid != rt_id}
+    plan_matches[plan_id] = rt_id
+    return plan_matches, False
+
+
+@app.callback(
+    [Output('store-plan-matches', 'data', allow_duplicate=True),
+     Output('match-modal', 'is_open', allow_duplicate=True)],
+    Input('btn-match-clear', 'n_clicks'),
+    [State('store-matching-plan-id', 'data'), State('store-plan-matches', 'data')],
+    prevent_initial_call=True,
+)
+def clear_match(n_clicks, plan_id, plan_matches):
+    if not n_clicks or not plan_id:
+        raise PreventUpdate
+    db.clear_plan_match(plan_id)
+    plan_matches = dict(plan_matches or {})
+    plan_matches.pop(plan_id, None)
+    return plan_matches, False
 
 
 @app.callback(
@@ -1377,18 +2155,21 @@ def ask_delete_plan(n_clicks_list, plans):
 
 @app.callback(
     [Output('store-plans', 'data', allow_duplicate=True),
-     Output('plan-add-status', 'children', allow_duplicate=True)],
+     Output('plan-add-status', 'children', allow_duplicate=True),
+     Output('store-plan-matches', 'data', allow_duplicate=True)],
     Input('confirm-delete-plan', 'submit_n_clicks'),
-    [State('store-pending-delete-plan', 'data'), State('store-plans', 'data')],
+    [State('store-pending-delete-plan', 'data'), State('store-plans', 'data'), State('store-plan-matches', 'data')],
     prevent_initial_call=True,
 )
-def do_delete_plan(submit_n_clicks, plan_id, plans):
+def do_delete_plan(submit_n_clicks, plan_id, plans, plan_matches):
     if not submit_n_clicks or not plan_id:
         raise PreventUpdate
-    db.delete_plan(plan_id)
+    db.delete_plan(plan_id)  # cascades to plan_matches in the DB (ON DELETE CASCADE)
     new_plans = [p for p in (plans or []) if p['plan_id'] != plan_id]
+    new_matches = dict(plan_matches or {})
+    new_matches.pop(plan_id, None)
     status = dbc.Alert("🗑️ Plan deleted.", color='secondary')
-    return new_plans, status
+    return new_plans, status, new_matches
 
 
 @app.callback(
@@ -1403,15 +2184,16 @@ def ask_clear_plans(n_clicks):
 
 
 @app.callback(
-    [Output('store-plans', 'data', allow_duplicate=True), Output('clear-status', 'children', allow_duplicate=True)],
+    [Output('store-plans', 'data', allow_duplicate=True), Output('clear-status', 'children', allow_duplicate=True),
+     Output('store-plan-matches', 'data', allow_duplicate=True)],
     Input('confirm-clear-plans', 'submit_n_clicks'),
     prevent_initial_call=True,
 )
 def do_clear_plans(submit_n_clicks):
     if not submit_n_clicks:
         raise PreventUpdate
-    n = db.delete_all_plans()
-    return [], dbc.Alert(f"🗑️ Deleted all {n} trade plan(s) from the database.", color='secondary')
+    n = db.delete_all_plans()  # cascades to plan_matches in the DB (ON DELETE CASCADE)
+    return [], dbc.Alert(f"🗑️ Deleted all {n} trade plan(s) from the database.", color='secondary'), {}
 
 
 @app.callback(

@@ -14,12 +14,21 @@ plan-adherence. Part of a three-system trading framework — see below.
 | System | Role | Connected to Claude? |
 |---|---|---|
 | **Wealthsimple** | Trade execution (TFSA + retirement accounts) | No — no public API. Manual only, by design. Never automate execution here, even if a connector existed. |
-| **TradingView** | Opportunity scanning/analysis, home of two custom Pine Script indicators | Yes, via MCP, in the claude.ai chat environment |
+| **TradingView** | Opportunity scanning/analysis, home of two custom Pine Script indicators | Yes — via MCP in the claude.ai chat environment, **and** (as of 2026-08-26) via the same MCP server added to Claude Code itself, user-scoped so it's available from any repo, not just this one. |
 | **TALCS** (this repo) | Trade planning, logging, execution reconciliation, coaching/scoring | Yes, via Claude Code, working directly in this repo |
 
 **Wealthsimple is the single source of truth** for what actually happened in the
 account (fills, timing, quantities). TradingView indicators inform *planning*, not
 final record-keeping.
+
+**Important distinction:** Claude Code having the TradingView MCP connection does
+*not* mean TALCS (the Dash app) can call MCP tools — TALCS runs as its own standalone
+Flask process, independent of any Claude session, so it has no path to invoke MCP.
+Where TALCS itself needs live TradingView data (the ATR fetch — see below), it talks
+directly to TradingView Desktop's Chrome DevTools Protocol (CDP) debug port
+(`127.0.0.1:9222`), the same port the tradingview-mcp server connects to. CDP allows
+multiple independent debugger connections to one target, so TALCS's direct read and a
+Claude Code session's MCP connection can both be live at once without conflicting.
 
 ## The Two Custom TradingView Indicators
 
@@ -74,11 +83,51 @@ implementation.
 3. Enter the actual fill price into TALCS. TALCS pulls a **fresh ATR reading at commit
    time** (not whatever ATR Sniper computed at signal time — ATR moves) and generates
    ATR-derived TP1–TP5 and stop levels off the real entry price.
+   **Implemented (2026-08-26/27).** Fully automatic as of 2026-08-27 — there is no
+   "Fetch ATR" button anymore; entering/changing the symbol (Add Plan form or Edit
+   modal) triggers the fetch on its own, and the resulting stop/T1–T5 targets
+   recompute automatically whenever entry price, ATR, or the ATR multiplier change
+   (as long as Method is "ATR-derived" — see step 4). ATR itself tries two sources
+   in order:
+   1. **Live TradingView Desktop**, read directly over CDP (`app.fetch_atr_from_tradingview`)
+      — *actively* corrects the chart to match the plan before reading: sets the
+      symbol if it doesn't match (bare-ticker comparison), forces the 1D timeframe
+      if it isn't already, then reads OHLC bars and computes Wilder's-smoothing
+      ATR(14) (matches Pine's `ta.atr` default). This mutates the user's live
+      TradingView Desktop session on purpose — an earlier passive
+      read-whatever's-on-screen-and-warn design was tried first and rejected
+      after testing showed it just used the wrong instrument's ATR too easily.
+      Switching the **saved chart layout** was also tried (to a layout named
+      "Multi-Window") but was **removed** after hands-on testing surfaced a
+      documented TradingView bug where switching between custom/saved layouts
+      via the API doesn't reliably apply — confirmed on this exact chart, so it's
+      not a bug in TALCS. The user manages the layout manually; symbol and
+      timeframe correction both tested reliable (verified live via an independent
+      TradingView MCP connection, not just TALCS's own read) and stay automatic.
+   2. **Yahoo Finance proxy** (`app.fetch_atr_from_yfinance`), used only when
+      TradingView Desktop isn't reachable — always daily bars regardless of the
+      chart's actual timeframe, so it's the coarser fallback, not the primary source.
+   Either way the fetched value lands in an editable field, per the earlier decision
+   that a wrong auto-fetched number must never silently drive a stop-loss.
 4. **The initial computed plan is always ATR-based.** A 3% (or symbol-specific,
    e.g. 6% for SSO/QLD) initial-target override is available but is a **manual, deliberate
    edit at plan finalization** — not an automatic per-symbol rule (for now — may become
    automatic later, but don't build it that way by default yet).
+   **Implemented.** An explicit ATR-derived/manual-override radio on the plan form sets
+   `plans.target_method`; `plans.atr_at_commit` and `plans.atr_multiplier` record the
+   provenance of whatever stop/targets were used. This radio is also the override
+   mechanism for the automatic recompute in step 3: while it's "ATR-derived", stop/
+   targets keep recomputing from entry+ATR; flipping it to "Manual override" freezes
+   whatever is currently in those fields, so a hand-typed value survives further
+   symbol/entry changes and persists through commit, per the same "deliberate edit"
+   principle this step already called for. Every stop/target price field also shows a
+   live read-only "% from entry" next to it, informational only, recomputed on every
+   edit including hand-typed ones.
 5. TALCS allows full editing of the plan before it's committed.
+   **Implemented** as a draft/commit lifecycle: "Save as Draft" vs. "Commit Plan" on the
+   Add Plan form, a "Draft Trade Plans" card (Edit/Commit/Discard), and `plans.status` +
+   `plans.committed_at` in the schema. Drafts are excluded from the journal, scoring, and
+   execution matching until committed.
 6. Once committed, TALCS draws the finalized plan as a **second, separate overlay** on
    the TradingView chart via the MCP drawing tools (lines/boxes) — this is distinct
    from Sniper's own native plotted lines, which stay as-is. Both overlays should be
@@ -91,6 +140,12 @@ implementation.
    - This overlay is **session-live only** — drawn into the current TradingView browser
      session via MCP, not a persistent saved annotation. It needs to be re-applied each
      time you want it visible in a fresh session.
+   **Not yet implemented.** Now technically more reachable than before — Claude Code
+   itself can drive the TradingView MCP drawing tools (`draw_shape` etc.) directly in a
+   chat session — but TALCS the Dash app still has no code path to trigger that
+   automatically on commit. Building this would mean either (a) doing the draw manually
+   via a Claude Code/claude.ai request after each commit, or (b) giving TALCS its own
+   CDP-based drawing calls the same way the ATR fetch works. Neither is built yet.
 7. Trade executions are re-downloaded from Wealthsimple at the end of any day a trade
    was made (not just at position close), to keep TALCS current.
 8. **Reconciliation approach:** TALCS attempts to auto-match newly downloaded
@@ -100,23 +155,62 @@ implementation.
    at TP3+), potentially spread across several days, and the same symbol may be
    re-entered later as a fresh, unrelated trade. The user can **manually override** the
    match when the auto-match guesses wrong.
+   **Implemented.** A "Match" button on each journal row opens a picker of candidate
+   round trips (same symbol+direction) and persists the override in a `plan_matches`
+   table, keyed on a deterministic round-trip id (`app.round_trip_id`, a hash of the
+   composing execution row ids — not a random uuid, so it's stable across recomputes).
 9. On trade close, TALCS scores the trade on two axes: **profitability** and
    **plan-adherence** (how closely actual execution followed the committed plan —
    entry, stop discipline, scale-out timing/levels).
+   **Partially implemented.** Profitability (P&L, %, R-multiple, a blended Plan Score)
+   is fully computed. Plan-adherence exists today only as qualitative execution notes
+   (targets hit, stop breach/respect, entry deviation %) plus that same blended score —
+   there is no separate, formal plan-adherence number yet. See Open items below.
 
 ## Open / Not-Yet-Decided
 
-- Full trade-plan schema (fields for plan vs. execution vs. scoring) — not yet
-  finalized as of this writing; next step in the design conversation.
+- **Full trade-plan schema** — resolved as of 2026-08-26. `plans` now has: the original
+  symbol/direction/dates/entry/stop/`targets_json`/qty/reason/notes, plus `status` +
+  `committed_at` (draft/commit lifecycle), `target_method`/`atr_at_commit`/
+  `atr_multiplier` (ATR provenance). A separate `plan_matches` table holds manual
+  plan↔round-trip overrides, keyed on a deterministic round-trip id rather than the
+  execution/plan rows themselves, so it survives recomputation.
 - Whether the 3%-style override should eventually become automatic per-symbol
   (currently: manual only, by design, until proven out).
-- Exact mechanics of the plan-adherence scoring algorithm.
+- Exact mechanics of the plan-adherence scoring algorithm — still just qualitative
+  notes + the profitability-based blended score; no separate formal adherence metric.
+- The TALCS-committed plan overlay on the TradingView chart (workflow step 6) — not
+  built. Newly *feasible* now that TradingView MCP is reachable from Claude Code, but
+  nobody has wired either a manual "ask Claude to draw it" step or a CDP-based
+  auto-draw into TALCS itself.
+- TradingView symbol/timeframe correction (now automatic, triggered by editing the
+  symbol field rather than a button) has been confirmed by the user in the actual
+  running app (2026-08-27), on top of earlier direct-function-call and live-CDP
+  testing. Still not click-tested end to end in a real browser: the automatic
+  stop/target recompute, the "% from entry" readouts, Save Draft → Commit, and the
+  Match modal.
+- Opening the Edit modal on an existing plan whose `target_method` is "ATR-derived"
+  re-populates entry/ATR, which re-triggers the automatic recompute (by design —
+  see step 4) — for a plan whose stored stop/targets already came from that same
+  ATR+multiplier formula this reproduces the same numbers, but it hasn't been tested
+  against a plan where they don't (e.g. an ATR-derived plan hand-tweaked without ever
+  flipping the radio to "Manual override"). If that turns out to matter in practice,
+  the fix is either warning on the mismatch or making Method sticky at the field level.
+- "Executed Trades Without a Plan" is now a sortable/filterable `dash_table.DataTable`
+  with a single "Log Plan for Selected Trade" button (row-select, then click) instead
+  of a per-row button — not yet click-tested in a real browser either.
 
 ## Environment Notes
 
 - claude.ai chat (with TradingView MCP connected) is used for market analysis, Pine
   Script discussion, and architecture/strategy conversations.
 - Claude Code (VS Code, this repo) is used for all actual TALCS implementation — data
-  model, Dash app, reconciliation logic, scoring.
-- These two environments do not share context automatically. This file is the handoff
-  mechanism — keep it updated as decisions are made or changed, in either environment.
+  model, Dash app, reconciliation logic, scoring. As of 2026-08-26 it *also* has its own
+  TradingView MCP connection (user-scoped, so it follows into any repo) — useful for
+  reading the live chart directly from a Claude Code session, but this is a separate
+  connection from TALCS's own CDP client (see the Three-System Architecture note above)
+  and from claude.ai chat's MCP connection; none of the three share state with each other.
+- These two environments (claude.ai chat and Claude Code) do not share conversation
+  context automatically, even though both can now reach TradingView. This file is the
+  handoff mechanism — keep it updated as decisions are made or changed, in either
+  environment.

@@ -1,0 +1,7 @@
+dash>=2.17
+dash-bootstrap-components>=1.5
+pandas>=2.0
+numpy>=1.24
+plotly>=5.18
+yfinance>=0.2.55
+websocket-client>=1.7

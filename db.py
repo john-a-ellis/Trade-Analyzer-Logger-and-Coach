@@ -141,6 +141,12 @@ def insert_executions(df: pd.DataFrame, db_path=DB_PATH) -> int:
     Returns the number of rows actually inserted."""
     if df is None or df.empty:
         return 0
+    if df.columns.duplicated().any():
+        # A duplicate-named column makes df['col'] return a Series instead of a
+        # scalar per row, which sqlite3 can't bind ("Error binding parameter 1:
+        # type 'Series' is not supported"). Callers should already dedupe at parse
+        # time; this is a defensive backstop, not the primary fix.
+        df = df.loc[:, ~df.columns.duplicated()]
     now = dt.datetime.utcnow().isoformat()
     rows = [
         (r['symbol'], r.get('name', r['symbol']), str(r['timestamp']), r['action'],
